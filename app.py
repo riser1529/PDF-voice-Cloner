@@ -55,18 +55,20 @@ with st.sidebar:
 def read_pdf_sentences(path: str):
     sentences = []
     p = Path(path)
-    if not p.exists():
-        return sentences
-    if PdfReader is None:
+    if not p.exists() or PdfReader is None:
         return sentences
     try:
         reader = PdfReader(str(p))
-        text = ""
+        text = []
         for page in reader.pages:
-            text += page.extract_text() or ""
-        # Naive sentence split: split by . ! ? while keeping them
-        import re
-        parts = re.split(r"(?<=[.!?])\s+", text.strip())
+            page_text = page.extract_text()
+            if page_text:
+                # Normalize line breaks & spaces
+                clean = re.sub(r"\s+", " ", page_text)
+                text.append(clean.strip())
+        full_text = " ".join(text)
+        # Split into sentences (keep punctuation)
+        parts = re.split(r'(?<=[.!?])\s+', full_text)
         sentences = [s.strip() for s in parts if s.strip()]
     except Exception as e:
         st.warning(f"Failed to parse PDF: {e}")
