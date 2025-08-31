@@ -1,8 +1,7 @@
-
 import streamlit as st
 from pathlib import Path
 import re
-from io import BytesIO
+import tempfile
 
 # Optional dependencies
 try:
@@ -35,7 +34,6 @@ with st.sidebar:
     st.caption("Upload a different PDF if you like:")
     uploaded_pdf = st.file_uploader("Upload PDF", type=["pdf"])
     if uploaded_pdf:
-        # Save uploaded to a temp path
         tmp_pdf = Path("uploaded.pdf")
         tmp_pdf.write_bytes(uploaded_pdf.read())
         pdf_path = str(tmp_pdf)
@@ -49,9 +47,10 @@ with st.sidebar:
     st.subheader("Merge Options")
     target_choice = st.selectbox("Which set to merge?", ["Cloned voice", "Base TTS"])
     output_name = st.text_input("Output filename", value="merged_output.wav")
-
     make_srt = st.checkbox("Also create captions (SRT)", value=True)
 
+
+# ----------- PDF READING -----------------
 def read_pdf_sentences(path: str):
     sentences = []
     p = Path(path)
@@ -63,21 +62,22 @@ def read_pdf_sentences(path: str):
         for page in reader.pages:
             page_text = page.extract_text()
             if page_text:
-                # Normalize line breaks & spaces
-                clean = re.sub(r"\s+", " ", page_text)
+                clean = re.sub(r"\s+", " ", page_text)  # normalize spaces
                 text.append(clean.strip())
         full_text = " ".join(text)
-        # Split into sentences (keep punctuation)
+        # Split into sentences
         parts = re.split(r'(?<=[.!?])\s+', full_text)
         sentences = [s.strip() for s in parts if s.strip()]
     except Exception as e:
         st.warning(f"Failed to parse PDF: {e}")
     return sentences
 
-# Extract numeric index from filenames like 'sentence_12.mp3' or 'Sentence 12.wav'
+
+# ----------- AUDIO CHUNKS HELPERS -----------------
 def extract_index(name: str):
     m = re.search(r"(?:sentence|Sentence)[ _-]?(\d+)", name)
-    return int(m.group(1)) if m else 10**9  # gigantic number to push unknowns to end
+    return int(m.group(1)) if m else 10**9
+
 
 def load_chunks(folder: Path, exts):
     out = []
@@ -88,7 +88,8 @@ def load_chunks(folder: Path, exts):
             out.append(p)
     return out
 
-# Load sentences and chunks
+
+# ----------- LOAD SENTENCES -----------------
 sentences = read_pdf_sentences(pdf_path)
 st.subheader("📖 Extracted Sentences from PDF")
 if sentences:
@@ -99,9 +100,42 @@ if sentences:
 else:
     st.info("No sentences extracted — either the PDF path is wrong or PyPDF2 is not installed.")
 
+
+# ----------- LOAD AUDIO CHUNKS -----------------
 base_chunks = load_chunks(Path(base_dir), {".mp3", ".wav", ".m4a", ".ogg", ".flac"})
 clone_chunks = load_chunks(Path(clone_dir), {".mp3", ".wav", ".m4a", ".ogg", ".flac"})
 
+# If no local chunks, allow uploads
+if not base_chunks and not clone_chunks:
+    st.warning("⚠️ No local audio chunks found. Upload your files below:")
+
+    uploaded_base = st.file_uploader(
+        "Upload Base TTS Chunks", type=["mp3", "wav"], accept_multiple_files=True
+    )
+    uploaded_clone = st.file_uploader(
+        "Upload Cloned Voice Chunks", type=["mp3", "wav"], accept_multiple_files=True
+    )
+
+    temp_dir = Path(tempfile.mkdtemp())
+
+    if uploaded_base:
+        st.success(f"Uploaded {len(uploaded_base)} Base TTS chunks.")
+        base_chunks = []
+        for f in uploaded_base:
+            tmp = temp_dir / f.name
+            tmp.write_bytes(f.read())
+            base_chunks.append(tmp)
+
+    if uploaded_clone:
+        st.success(f"Uploaded {len(uploaded_clone)} Cloned Voice chunks.")
+        clone_chunks = []
+        for f in uploaded_clone:
+            tmp = temp_dir / f.name
+            tmp.write_bytes(f.read())
+            clone_chunks.append(tmp)
+
+
+# ----------- DISPLAY CHUNKS -----------------
 tabs = st.tabs(["🎙️ Cloned Voice Chunks", "🗣️ Base TTS Chunks"])
 for tab, chunks, label in [
     (tabs[0], clone_chunks, "Cloned voice"),
@@ -109,7 +143,7 @@ for tab, chunks, label in [
 ]:
     with tab:
         if not chunks:
-            st.warning(f"No audio files found in the selected folder for **{label}**.")
+            st.warning(f"No audio files found for **{label}**.")
         else:
             st.success(f"Found {len(chunks)} chunk(s).")
             for i, p in enumerate(chunks, 1):
@@ -121,6 +155,8 @@ for tab, chunks, label in [
                 if i < len(chunks):
                     st.divider()
 
+
+# ----------- MERGE FUNCTION -----------------
 def merge_chunks(chunks, out_path: Path, make_srt=True):
     if AudioSegment is None:
         st.error("pydub is not installed. Please install it (and ffmpeg) to enable merging.")
@@ -128,27 +164,29 @@ def merge_chunks(chunks, out_path: Path, make_srt=True):
     if not chunks:
         st.error("No chunks to merge.")
         return None, None
+
     audio = None
-    timestamps = []  # (start_ms, end_ms, sentence_text)
+    timestamps = []
     cur_ms = 0
+
     for idx, p in enumerate(chunks, 1):
         seg = AudioSegment.from_file(p)
         if audio is None:
             audio = seg
         else:
             audio += seg
-        start = cur_ms
-        end = cur_ms + len(seg)
+        start, end = cur_ms, cur_ms + len(seg)
         cur_ms = end
-        # Optional sentence text by index, best-effort
+
         sent_text = ""
         si = extract_index(p.name)
         if 1 <= si <= len(sentences):
             sent_text = sentences[si-1]
         timestamps.append((start, end, sent_text))
-    # Export
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     audio.export(out_path, format=out_path.suffix.lstrip("."))
+
     srt_bytes = None
     if make_srt:
         def ms_to_ts(ms):
@@ -159,30 +197,31 @@ def merge_chunks(chunks, out_path: Path, make_srt=True):
             s = ms // 1000
             ms %= 1000
             return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
         lines = []
         for i, (start, end, txt) in enumerate(timestamps, 1):
             lines.append(str(i))
             lines.append(f"{ms_to_ts(start)} --> {ms_to_ts(end)}")
             lines.append(txt if txt else f"Sentence {i}")
-            lines.append("")  # blank line
+            lines.append("")
         srt_bytes = "\n".join(lines).encode("utf-8")
+
     return out_path, srt_bytes
 
+
+# ----------- MERGE BUTTON -----------------
 st.divider()
 st.header("🧩 Merge")
 if st.button("Merge selected set now"):
-    target = target_choice
-    if target == "Cloned voice":
-        chunks = clone_chunks
-    else:
-        chunks = base_chunks
+    chunks = clone_chunks if target_choice == "Cloned voice" else base_chunks
     out_file = Path(output_name)
     out, srt = merge_chunks(chunks, out_file, make_srt=make_srt)
+
     if out:
-        st.success(f"Merged {len(chunks)} chunks → **{out.name}** (saved in current working directory).")
+        st.success(f"Merged {len(chunks)} chunks → **{out.name}**")
         with open(out, 'rb') as f:
             st.download_button("Download merged audio", data=f, file_name=out.name)
     if srt:
         st.download_button("Download captions (SRT)", data=srt, file_name=out_file.with_suffix(".srt").name)
 
-st.info("Tip: If the sentence numbering in filenames starts from 0 or is non-sequential, the app still sorts by the number it finds in each filename.")
+st.info("💡 Tip: If filenames are not sequential, sorting will still try to match by number inside the name.")
